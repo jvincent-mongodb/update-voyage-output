@@ -1,0 +1,16 @@
+# Runtime deps for update_voyage_output.py (tool + the example scripts it runs).
+# Install into the repo venv:
+#   uv venv --python 3.13 .venv
+#   uv pip install --python .venv/bin/python -r requirements.txt
+pyyaml
+voyageai
+anthropic
+openai
+numpy
+pymongo
+langchain-community
+langchain-text-splitters
+pypdf
+python-dotenv
+Pillow
+datasets
