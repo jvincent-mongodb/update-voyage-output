@@ -12,11 +12,11 @@ release, routing LLM API calls through MongoDB's **Grove** gateway.
 ```bash
 # 1. one-time setup
 uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python \
-    pyyaml voyageai anthropic openai numpy pymongo \
-    langchain-community langchain-text-splitters pypdf python-dotenv Pillow datasets
+uv pip install --python .venv/bin/python -r requirements.txt
 
 # 2. refresh the inventory after the docs PR updates model ids / outputs
+#    (this also re-scans what the examples import, patches requirements.txt,
+#    and installs the delta with `uv pip` — skip that with --no-sync)
 .venv/bin/python update_voyage_output.py inventory
 
 # 3. convert examples to Grove-compatible + run them, writing output mirrors
@@ -25,6 +25,12 @@ export VOYAGE_API_KEY=...      # required
 export MONGODB_URI=...         # for the two RAG-with-MongoDB app variants
 .venv/bin/python update_voyage_output.py all --timeout 3600
 ```
+
+`requirements.txt` is kept in sync automatically: `inventory` scans what the
+examples actually `import`, diffs it against the file, rewrites it, and runs
+`uv pip install --python .venv/bin/python -r requirements.txt`. Since docs
+examples gain/hand-off packages release over release, that keeps the venv
+ready without manual edits.
 
 The location of the docs monorepo clone defaults to the path recorded in
 `inventory.yaml`; to point at a different clone (e.g. on another machine), pass

@@ -19,7 +19,9 @@ Two sibling repos sit under the parent dir `..`:
 
 - `update_voyage_output.py inventory` — scan `content/voyageai` for documented
   outputs (`.. output::` directive file-backed or inline, plus unreferenced
-  `*-output.md` files) → write `inventory.yaml`.
+  `*-output.md` files) → write `inventory.yaml`. Also syncs `requirements.txt`
+  to what the examples import and installs the delta with `uv pip` (opt out via
+  `--no-sync`); see `TOOL_DEPS`/`EXTRA_RUNTIME_DEPS` in the script.
 - `update_voyage_output.py convert` — copy each example into `converted/<mirror>`,
   rewriting LLM-calling files to point at Grove (`api-key` header, Anthropic
   route `<base>/anthropic`, OpenAI route `<base>/openai/v1`, `GROVE_MODEL`

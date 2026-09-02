@@ -101,6 +101,34 @@ GROVE_MODEL_FALLBACKS: dict[str, list[str]] = {
     "claude-sonnet-4-5-20250929": ["claude-sonnet-4-6"],
 }
 
+# --------------------------------------------------------------------------- #
+# Dependency detection / requirements.txt sync
+# --------------------------------------------------------------------------- #
+# Example dependencies are not static — a model release can add a package (e.g.
+# `datasets` for the large-corpus example). `inventory` therefore scans what the
+# examples actually import, diffs it against requirements.txt, rewrites the file,
+# and installs the delta with `uv pip install`.
+
+# The tool itself always needs these, regardless of what the examples import.
+TOOL_DEPS = ["pyyaml"]
+
+# Packages the examples depend on at runtime WITHOUT importing directly (e.g.
+# langchain's PyPDFLoader loads PDFs via `pypdf`). Keep this list curated; an
+# import-only scan cannot discover these.
+EXTRA_RUNTIME_DEPS = ["pypdf"]
+
+# import module name -> pip package name where they differ (default: hyphenate).
+MODULE_TO_PIP = {
+    "yaml": "pyyaml",
+    "PIL": "Pillow",
+    "dotenv": "python-dotenv",
+    "cv2": "opencv-python",
+    "sklearn": "scikit-learn",
+}
+
+_STDLIB_MODULES = frozenset(getattr(sys, "stdlib_module_names", ()))
+_REQ_NAME_RE = re.compile(r"^([A-Za-z0-9_.\-]+)")
+
 # Scope: only this subtree of the docs repo is inventoried.
 DOCS_SCOPE = "content/voyageai"
 
@@ -611,6 +639,137 @@ def write_yaml(path: Path, obj: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Dependency sync (requirements.txt)
+# --------------------------------------------------------------------------- #
+
+def _module_to_pip(module: str) -> str:
+    if module in _STDLIB_MODULES:
+        return ""
+    return MODULE_TO_PIP.get(module, module.replace("_", "-"))
+
+
+def _import_modules(text: str, local_names: set[str]) -> set[str]:
+    mods: set[str] = set()
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return mods
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                mods.add(a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            mods.add(node.module.split(".")[0])
+    return {m for m in mods if m not in local_names and _module_to_pip(m)}
+
+
+def example_pip_deps(docs_repo: Path, ex: dict) -> set[str]:
+    """Pip package names an example needs, based on its imports.
+
+    Local modules (config.py, ingest_data.py …) are recognized from the flat app
+    assembly / sibling files, never reported as third-party deps.
+    """
+    kind = ex.get("kind")
+    if kind == "block":
+        text = extract_inline_python(docs_repo / ex["source"], ex.get("block", ""))
+        return set(_module_to_pip(m) for m in _import_modules(text, set()))
+
+    if kind == "script":
+        src = docs_repo / ex["source"]
+        if not src.is_file():
+            return set()
+        local = {p.stem for p in src.parent.glob("*.py")}
+        return set(_module_to_pip(m) for m in _import_modules(
+            src.read_text(encoding="utf-8", errors="replace"), local))
+
+    if kind == "app":
+        local = {Path(f).stem for f in ex.get("files", [])}
+        deps: set[str] = set()
+        for f in ex.get("files", []):
+            src = docs_repo / f
+            if src.is_file():
+                deps |= {_module_to_pip(m) for m in _import_modules(
+                    src.read_text(encoding="utf-8", errors="replace"), local)}
+        return deps
+    return set()
+
+
+def detect_requirements(docs_repo: Path, inv: dict) -> list[str]:
+    """Sorted union of pip deps needed by the tool + every inventoried example."""
+    deps: set[str] = set(TOOL_DEPS) | set(EXTRA_RUNTIME_DEPS)
+    for out in inv.get("outputs", []):
+        for ex in out.get("derived_from", []):
+            deps |= example_pip_deps(docs_repo, ex)
+    return sorted(deps)
+
+
+def parse_requirements(path: Path) -> list[tuple[str, str]]:
+    """[(full_line, normalized_base_name)] for non-comment lines."""
+    if not path.is_file():
+        return []
+    out = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _REQ_NAME_RE.match(line)
+        out.append((line, (m.group(1) if m else line).lower()))
+    return out
+
+
+def sync_requirements(docs_repo: Path, inv: dict, req_path: Path, *,
+                      install: bool, python: Path, verbose: bool) -> bool:
+    """Rewrite requirements.txt to match what the examples need, then (unless
+    install=False) apply it with `uv pip install`. Returns success."""
+    desired = detect_requirements(docs_repo, inv)
+    entries = parse_requirements(req_path)
+    existing = {name: line for line, name in entries}
+    desired_lower = {d.lower() for d in desired}
+
+    added = sorted(d for d in desired if d.lower() not in existing)
+    removed = sorted(line for line, name in entries if name not in desired_lower)
+
+    changed = bool(added or removed)
+    if changed:
+        kept = [line for line, name in entries if name in desired_lower]
+        body = "\n".join(kept + added)
+        req_path.write_text(
+            "# Runtime dependencies for update_voyage_output.py — kept in sync "
+            "automatically\n"
+            "# by `update_voyage_output.py inventory` (edit example code, not "
+            "this file).\n"
+            "# Install: uv venv --python 3.13 .venv && "
+            "uv pip install --python .venv/bin/python -r requirements.txt\n"
+            "#\n" + body + "\n",
+            encoding="utf-8")
+        print(f"  requirements.txt: +{len(added)} -{len(removed)} "
+              f"({' '.join(added) or '-'}/{','.join(removed) or '-'})")
+
+    if not install:
+        return True
+    if not changed:
+        print("  requirements.txt: up to date (nothing to install)")
+        return True
+
+    uv = shutil.which("uv")
+    if not uv:
+        print("  !! `uv` not found on PATH — wrote requirements.txt but did not "
+              "install; run `uv pip install --python .venv/bin/python -r "
+              f"{req_path}`", file=sys.stderr)
+        return False
+    cmd = [uv, "pip", "install", "--python", str(python),
+           "-r", str(req_path), "--quiet"]
+    if verbose:
+        print("  $ " + " ".join(cmd))
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        print("  !! uv pip install failed:\n" + (r.stderr or "")[-3000:], file=sys.stderr)
+        return False
+    print("  requirements.txt: updated and installed via uv pip")
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # Grove conversion
 # --------------------------------------------------------------------------- #
 
@@ -1117,6 +1276,8 @@ def build_parser(default_root: Path) -> argparse.ArgumentParser:
                         help="grove-converted tree root (default <root>/converted)")
         sp.add_argument("--outputs-root", default=None,
                         help="run-output tree root (default <root>/outputs)")
+        sp.add_argument("--requirements-path", default=None,
+                        help="requirements.txt path (default <root>/requirements.txt)")
         sp.add_argument("--no-key-check", action="store_true",
                         help="do not require GROVE_API_KEY/VOYAGE_API_KEY (dry-run only)")
         sp.add_argument("--verbose", action="store_true")
@@ -1124,6 +1285,8 @@ def build_parser(default_root: Path) -> argparse.ArgumentParser:
     sp = sub.add_parser("inventory", help="scan content/voyageai and write inventory.yaml")
     add_common(sp)
     sp.add_argument("--force", action="store_true", help="ignore existing inventory.yaml")
+    sp.add_argument("--no-sync", action="store_true",
+                    help="skip dependency sync (requirements.txt + uv pip install)")
 
     sp = sub.add_parser("convert", help="build grove-compatible example copies")
     add_common(sp)
@@ -1145,6 +1308,8 @@ def build_parser(default_root: Path) -> argparse.ArgumentParser:
     sp = sub.add_parser("all", help="inventory + convert + run (end-to-end release pass)")
     add_common(sp)
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--no-sync", action="store_true",
+                    help="skip dependency sync (requirements.txt + uv pip install)")
     sp.add_argument("--python", default=None)
     sp.add_argument("--timeout", type=int, default=1800)
     sp.add_argument("--dry-run", action="store_true")
@@ -1164,6 +1329,7 @@ def resolve_paths(args, root: Path) -> None:
     args.inventory_path = getattr(args, "inventory_path", None) or str(root / "inventory.yaml")
     args.converted_root = getattr(args, "converted_root", None) or str(root / "converted")
     args.outputs_root = getattr(args, "outputs_root", None) or str(root / "outputs")
+    args.requirements_path = getattr(args, "requirements_path", None) or str(root / "requirements.txt")
     if not getattr(args, "python", None):
         # Prefer the repo's venv when present (it has voyageai/anthropic/openai/
         # numpy/... installed); sys.executable is a reasonable fallback.
@@ -1246,8 +1412,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         existing = load_existing_inventory(inv_path, getattr(args, "force", False))
         args.docs_repo = resolve_docs_repo(args, existing)
         inv = build_inventory(Path(args.docs_repo), existing)
-        write_yaml(inv_path, inv)
-        print(f"wrote {inv_path}\n  outputs: {len(inv['outputs'])}   "
+        if write_inventory_if_changed(inv_path, inv, existing):
+            print(f"wrote {inv_path}")
+        else:
+            print(f"inventory unchanged ({inv_path} not rewritten)")
+        if not getattr(args, "no_sync", False):
+            sync_requirements(Path(args.docs_repo), inv, Path(args.requirements_path),
+                              install=True, python=Path(args.python),
+                              verbose=getattr(args, "verbose", False))
+        print(f"  outputs: {len(inv['outputs'])}   "
               f"voyage models: {inv['voyage_models_observed']}")
         if inv.get("stale_output_ids"):
             print("  stale (no longer detected): " + ", ".join(inv["stale_output_ids"]))
@@ -1262,8 +1435,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         existing = load_existing_inventory(inv_path, getattr(args, "force", False))
         args.docs_repo = resolve_docs_repo(args, existing)
         inv = build_inventory(Path(args.docs_repo), existing)
-        write_yaml(inv_path, inv)
-        print(f"inventory refreshed at {inv_path}")
+        if write_inventory_if_changed(inv_path, inv, existing):
+            print(f"inventory refreshed at {inv_path}")
+        else:
+            print(f"inventory unchanged ({inv_path} not rewritten)")
+        if not getattr(args, "no_sync", False):
+            sync_requirements(Path(args.docs_repo), inv, Path(args.requirements_path),
+                              install=True, python=Path(args.python),
+                              verbose=getattr(args, "verbose", False))
     else:
         try:
             with open(args.inventory_path, encoding="utf-8") as fh:
@@ -1287,6 +1466,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.command == "models":
         return cmd_models(args)
     return 0
+
+
+def write_inventory_if_changed(inv_path: Path, inv: dict, existing: Optional[dict]) -> bool:
+    """Write inventory.yaml only when something other than `generated_at`
+    changed, so regenerating on a release doesn't churn git history."""
+    if existing is None:
+        write_yaml(inv_path, inv)
+        return True
+    new = {k: v for k, v in inv.items() if k != "generated_at"}
+    old = {k: v for k, v in existing.items() if k != "generated_at"}
+    if new == old:
+        return False
+    write_yaml(inv_path, inv)
+    return True
 
 
 if __name__ == "__main__":

@@ -243,6 +243,25 @@ Assets (images): `--assets-dir DIR` provides `cat.jpg`/`dog.jpg`/`banana.jpg`;
 if the file is missing the example is skipped with an actionable message
 (multimodal example + the `count_usage` tokenization block both need them).
 
+## 6b. Dependency sync (requirements.txt)
+
+Example dependencies are not static — releases add packages (e.g. `datasets`
+for the large-corpus example). `inventory` therefore:
+
+1. Scans the imports of every inventoried example (script/app files + inline
+   blocks) with `ast`, excluding stdlib and local modules (config.py,
+   ingest_data.py … — recognized from the flat app assembly / sibling files).
+2. Maps module → pip name (yaml→pyyaml, PIL→Pillow, dotenv→python-dotenv,
+   else hyphenated) and unions with the tool's own deps (`TOOL_DEPS`,
+   `EXTRA_RUNTIME_DEPS`, and `requirements.txt`'s header comments).
+3. Diffs against `requirements.txt`, rewrites it (preserving kept-line order,
+   appending new, dropping stale), and — unless `--no-sync` — runs
+   `uv pip install --python <venv> -r requirements.txt --quiet`.
+
+Direct imports can't see runtime-only deps that a framework pulls in behind the
+scenes (langchain's `PyPDFLoader` uses `pypdf` even though nothing imports it
+directly), which is why `EXTRA_RUNTIME_DEPS` exists as a curated baseline.
+
 ## 7. Release checklist (a "major Voyage AI model release")
 
 1. Docs PR updates the example scripts/pages (model ids, expected output text).
