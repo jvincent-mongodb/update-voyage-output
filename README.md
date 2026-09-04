@@ -4,6 +4,10 @@ Tooling to regenerate the **documented output** of the Voyage AI docs
 (`content/voyageai` in `docs-mongodb-internal`) after a major Voyage AI model
 release, routing LLM API calls through MongoDB's **Grove** gateway.
 
+### Clone this utility down to your local machine: 
+
+```git clone git@github.com:jvincent-mongodb/update-voyage-output.git```
+
 ## Procedure
 
 ```bash
