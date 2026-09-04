@@ -132,8 +132,9 @@ _REQ_NAME_RE = re.compile(r"^([A-Za-z0-9_.\-]+)")
 # Scope: only this subtree of the docs repo is inventoried.
 DOCS_SCOPE = "content/voyageai"
 
-# Filename patterns that identify "documented output" markdown files under source/includes/.
-OUTPUT_MD_PATTERNS = ("-output.md", "_output.md")
+# Documented outputs are .out files under source/includes/ (namely example-code-output/),
+# pulled into pages via a  .. output:: /includes/example-code-output/<name>.out  directive.
+OUTPUT_FILE_SUFFIX = ".out"
 
 # Voyage model ids / rerank ids appearing in example source. Anything matching is a
 # Voyage API call target and must NOT be redirected to Grove.
@@ -175,12 +176,9 @@ def slugify(text: str) -> str:
     return text or "block"
 
 
-def is_output_md(rel: str) -> bool:
-    return Path(rel).name.endswith(OUTPUT_MD_PATTERNS)
-
-
 def resolve_include_argument(arg: str, scope_root: str) -> str:
-    """Map a  .. output:: /includes/foo.md  argument to a docs-repo-relative path."""
+    """Map a  .. output:: /includes/example-code-output/foo.out  argument to a
+    docs-repo-relative path."""
     if arg.startswith("/"):
         return f"{scope_root}/source{arg}"
     return arg
@@ -364,7 +362,7 @@ def discover_outputs(docs_repo: Path) -> tuple[list[DetectedOutput], list[str]]:
         for node in _walk(tree, "output"):
             arg = node["arg"]
             if arg:
-                # File-backed:  .. output:: /includes/rag/shared/rag-output.md
+                # File-backed:  .. output:: /includes/example-code-output/main.out
                 target = resolve_include_argument(arg, DOCS_SCOPE)
                 file_targets.add(target)
                 if target in {o.key for o in outputs}:
@@ -389,13 +387,11 @@ def discover_outputs(docs_repo: Path) -> tuple[list[DetectedOutput], list[str]]:
                 rendered_in=[rel],
             ))
 
-    # ---- pass 2: standalone output .md files not referenced by a directive ----
-    for md in sorted((scope / "source" / "includes").rglob("*")):
-        if not md.is_file() or md.suffix != ".md":
+    # ---- pass 2: standalone output .out files not referenced by a directive ----
+    for f in sorted((scope / "source" / "includes").rglob("*")):
+        if not f.is_file() or f.suffix != OUTPUT_FILE_SUFFIX:
             continue
-        rel = md.relative_to(docs_repo).as_posix()
-        if not is_output_md(rel):
-            continue
+        rel = f.relative_to(docs_repo).as_posix()
         if rel not in file_targets and rel not in {o.key for o in outputs}:
             outputs.append(DetectedOutput(
                 key=rel, kind="file", path_rel=rel, line=0,
@@ -411,141 +407,88 @@ def discover_outputs(docs_repo: Path) -> tuple[list[DetectedOutput], list[str]]:
 
 
 # --------------------------------------------------------------------------- #
-# Curated map: documented output -> example(s) that produce it
+# Output -> example derivation (source named after the .out file)
 # --------------------------------------------------------------------------- #
-# The scan reliably discovers WHERE outputs live. Deciding WHICH example scripts
-# produce them is knowledge that must be curated — a writer may add/rename/remove
-# example files on a release. The keys below match discover_outputs() exactly.
+# Writer's contract, by design: a documented output's ``.out`` file names its
+# source script — ``example-code-output/semantic_search_basic.out`` is produced
+# by ``semantic_search_basic.py`` somewhere under ``content/voyageai/source``.
+# Nothing is curated: ``derive_derived_from`` derives ``derived_from[].source``
+# from the .out stem, and when there is no *unique* ``<stem>.py`` it returns an
+# error the caller surfaces — the writer fixes the file names, the tool does not
+# guess. Metadata you can read off the source (LLM provider/model, env vars,
+# image assets) is derived from the source file itself.
 
-def script(name, rel, llm_models=(), providers=(), env=(), assets=(), kind_block=None):
-    """An example described by a single script file (default), or — when
-    ``kind_block`` is set — by an inline python block embedded in a page."""
-    if kind_block:
-        return {"name": name, "kind": "block", "source": rel, "files": [],
-                "entrypoint": None, "needs_grove": False, "providers": [],
-                "env_vars": [], "assets": list(assets), "llm_models": [],
-                "model": "", "stdin": [], "block": kind_block}
-    return {"name": name, "kind": "script", "source": rel, "files": [],
-            "entrypoint": None, "needs_grove": bool(llm_models),
-            "providers": list(providers), "env_vars": list(env),
-            "assets": list(assets), "llm_models": list(llm_models),
-            "model": llm_models[0] if llm_models else "", "stdin": []}
+# Anthropic/OpenAI model literals in example source -> Grove conversion + run fallback.
+LLM_MODEL_RE = re.compile(r"(?:claude|gpt)[-A-Za-z0-9.]+")
+_ENV_REF_RE = re.compile(
+    r'os\.(?:getenv|environ\.get)\(\s*["\']([A-Z][A-Z0-9_]*)["\']'
+    r"|os\.environ\[['\"]([A-Z][A-Z0-9_]*)['\"]\]"
+)
+_ASSET_RE = re.compile(r"['\"]([A-Za-z0-9_.\-]+\.(?:jpg|jpeg|png|gif|webp))['\"]")
+# Env vars the pipeline manages itself — never reported back to the writer.
+_TOOL_ENV = {"GROVE_API_KEY", "GROVE_BASE_URL", "GROVE_MODEL",
+             "VOYAGE_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"}
 
-
-def app(name, base_dir, files, entrypoint, llm_models=(), providers=(), env=(), stdin=()):
-    return {"name": name, "kind": "app", "source": base_dir, "files": list(files),
-            "entrypoint": entrypoint, "needs_grove": bool(llm_models),
-            "providers": list(providers), "env_vars": list(env),
-            "assets": [], "llm_models": list(llm_models),
-            "model": llm_models[0] if llm_models else "", "stdin": list(stdin)}
-
-
-SS = "content/voyageai/source/includes/semantic-search"
-RG = "content/voyageai/source/includes/rag"
-
-CURATED: dict[str, dict[str, Any]] = {
-    # ----- file-backed outputs --------------------------------------------------
-    f"{SS}/basic-output.md": {
-        "title": "Semantic search — basic dot-product example",
-        "derived_from": [script("semantic_search_basic", f"{SS}/semantic_search_basic.py")],
-    },
-    f"{SS}/reranker-output.md": {
-        "title": "Semantic search — reranker example",
-        "derived_from": [script("semantic_search_reranker", f"{SS}/semantic_search_reranker.py")],
-    },
-    f"{SS}/multilingual-output.md": {
-        "title": "Semantic search — multilingual example",
-        "derived_from": [script("semantic_search_multilingual", f"{SS}/semantic_search_multilingual.py")],
-    },
-    f"{SS}/multimodal-output.md": {
-        "title": "Semantic search — multimodal example",
-        "derived_from": [script("semantic_search_multimodal", f"{SS}/semantic_search_multimodal.py",
-                                assets=["cat.jpg", "dog.jpg", "banana.jpg"])],
-    },
-    f"{SS}/contextualized-output.md": {
-        "title": "Semantic search — contextualized embeddings example",
-        "derived_from": [script("semantic_search_contextualized", f"{SS}/semantic_search_contextualized.py")],
-    },
-    f"{SS}/large-corpus-output.md": {
-        "title": "Semantic search — large corpus (mteb) example",
-        "derived_from": [script("semantic_search_large_corpus", f"{SS}/semantic_search_large_corpus.py")],
-    },
-    f"{RG}/shared/rag-output.md": {
-        "title": "RAG with MongoDB — full pipeline output (python main.py)",
-        "derived_from": [
-            app("rag_mongodb_anthropic", RG,
-                files=[f"{RG}/shared/main.py", f"{RG}/shared/ingest_data.py",
-                       f"{RG}/shared/retrieve_data.py", f"{RG}/shared/get-embeddings-voyage.py",
-                       f"{RG}/python-anthropic/config.py",
-                       f"{RG}/python-anthropic/generate_response.py"],
-                entrypoint="main.py",
-                llm_models=["claude-sonnet-4-5-20250929"], providers=["anthropic"],
-                env=["MONGODB_URI"],
-                stdin=["Y", "What are the latest Voyage AI announcements?"]),
-            app("rag_mongodb_openai", RG,
-                files=[f"{RG}/shared/main.py", f"{RG}/shared/ingest_data.py",
-                       f"{RG}/shared/retrieve_data.py", f"{RG}/shared/get-embeddings-voyage.py",
-                       f"{RG}/python-openai/config.py",
-                       f"{RG}/python-openai/generate_response.py"],
-                entrypoint="main.py",
-                llm_models=["gpt-4o"], providers=["openai"],
-                env=["MONGODB_URI"],
-                stdin=["Y", "What are the latest Voyage AI announcements?"]),
-        ],
-    },
-    f"{RG}/shared/in-memory-rag-output.md": {
-        "title": "RAG in-memory — output markdown",
-        "derived_from": [
-            script("rag_in_memory_anthropic", f"{RG}/python-anthropic/in-memory-rag.py",
-                   llm_models=["claude-sonnet-4-5-20250929"], providers=["anthropic"]),
-            script("rag_in_memory_openai", f"{RG}/python-openai/in-memory-rag.py",
-                   llm_models=["gpt-4o"], providers=["openai"]),
-        ],
-    },
-
-    # ----- inline outputs ---------------------------------------------------------
-    "content/voyageai/source/quickstart.txt#generate-your-first-embeddings": {
-        "title": "Quick start — Generate Your First Embeddings output",
-        "derived_from": [script("quickstart_generate_embeddings",
-                                "content/voyageai/source/includes/quickstart/generate-embeddings.py")],
-    },
-    "content/voyageai/source/includes/quickstart/step-run-app.rst#block-0": {
-        "title": "Quick start RAG application output (shared by anthropic + openai tabs)",
-        "derived_from": [
-            script("quickstart_rag_anthropic",
-                   "content/voyageai/source/includes/quickstart/rag-application-anthropic.py",
-                   llm_models=["claude-sonnet-4-5-20250929"], providers=["anthropic"]),
-            script("quickstart_rag_openai",
-                   "content/voyageai/source/includes/quickstart/rag-application-openai.py",
-                   llm_models=["gpt-4o"], providers=["openai"]),
-        ],
-    },
-    "content/voyageai/source/includes/rag/shared/run-pipeline-instructions-in-memory.rst#block-0": {
-        "title": "RAG in-memory — run-app output (inline)",
-        "derived_from": [
-            script("rag_in_memory_anthropic", f"{RG}/python-anthropic/in-memory-rag.py",
-                   llm_models=["claude-sonnet-4-5-20250929"], providers=["anthropic"]),
-            script("rag_in_memory_openai", f"{RG}/python-openai/in-memory-rag.py",
-                   llm_models=["gpt-4o"], providers=["openai"]),
-        ],
-    },
-    "content/voyageai/source/tutorials/tokenization.txt#tokenize-method": {
-        "title": "Tokenization — tokenize method output",
-        "derived_from": [script("tokenize", "content/voyageai/source/tutorials/tokenization.txt",
-                                kind_block="tokenize-method")],
-    },
-    "content/voyageai/source/tutorials/tokenization.txt#count-tokens-method": {
-        "title": "Tokenization — count_tokens method output",
-        "derived_from": [script("count_tokens", "content/voyageai/source/tutorials/tokenization.txt",
-                                kind_block="count-tokens-method")],
-    },
-    "content/voyageai/source/tutorials/tokenization.txt#count-usage-method": {
-        "title": "Tokenization — count_usage method output",
-        "derived_from": [script("count_usage", "content/voyageai/source/tutorials/tokenization.txt",
-                                kind_block="count-usage-method",
-                                assets=["banana.jpg"])],
-    },
+# Human-readable titles per .out stem (cosmetic; default falls back to a generic).
+OUTPUT_TITLES = {
+    "generate-embeddings": "Quick start — Generate Your First Embeddings output",
+    "rag-application": "Quick start RAG application output",
+    "in-memory-rag": "RAG in-memory — run-app output",
+    "main": "RAG with MongoDB — full pipeline output",
+    "semantic_search_basic": "Semantic search — basic dot-product example",
+    "semantic_search_reranker": "Semantic search — reranker example",
+    "semantic_search_multilingual": "Semantic search — multilingual example",
+    "semantic_search_multimodal": "Semantic search — multimodal example",
+    "semantic_search_contextualized": "Semantic search — contextualized embeddings example",
+    "semantic_search_large_corpus": "Semantic search — large corpus (mteb) example",
+    "tokenization-tokenize": "Tokenization — tokenize method output",
+    "tokenization-count-tokens": "Tokenization — count_tokens method output",
+    "tokenization-count-usage": "Tokenization — count_usage method output",
 }
+
+
+def derive_derived_from(docs_repo: Path, det) -> tuple[list[dict], Optional[str]]:
+    """Map a file-backed ``.. output::`` output to its example script.
+
+    ``<name>.out`` must be produced by ``<name>.py``. Returns
+    ``(derived_from, error_or_None)``: a unique stem match yields one script
+    entry with metadata read off the source; zero or several matches yield
+    ``([], error)`` so the caller alerts the writer instead of inferring.
+    """
+    stem = Path(det.path_rel).stem
+    matches = sorted(
+        f.relative_to(docs_repo).as_posix()
+        for f in (docs_repo / DOCS_SCOPE / "source").rglob("*.py")
+        if f.stem == stem
+    )
+    if not matches:
+        return [], (f"no source script {stem!r}.py under {DOCS_SCOPE}/source — "
+                    "name the .out file after its source (minus the extension)")
+    if len(matches) > 1:
+        return [], (f"{len(matches)} source scripts stem {stem!r}: "
+                    + ", ".join(matches) + " — rename them so exactly one matches "
+                    f"{stem}.out")
+    rel = matches[0]
+    text = (docs_repo / rel).read_text(encoding="utf-8", errors="replace")
+    llm_models = list(dict.fromkeys(LLM_MODEL_RE.findall(text)))
+    providers = [p for p in ("anthropic", "openai")
+                 if re.search(rf"(?im)^\s*(?:import {p}\b|from {p}\b)", text)]
+    env_vars = sorted({(a or b) for a, b in _ENV_REF_RE.findall(text)} - _TOOL_ENV)
+    assets = sorted(set(_ASSET_RE.findall(text)))
+    return [{
+        "name": stem,
+        "kind": "script",
+        "source": rel,
+        "files": [],
+        "entrypoint": None,
+        "needs_grove": bool(llm_models),
+        "providers": providers,
+        "env_vars": env_vars,
+        "assets": assets,
+        "llm_models": llm_models,
+        "model": llm_models[0] if llm_models else "",
+        "stdin": [],
+    }], None
 
 
 # --------------------------------------------------------------------------- #
@@ -561,14 +504,21 @@ def stable_output_id(det: DetectedOutput) -> str:
 
 
 def _example_mirror(output: dict, ex: dict, ex_idx: int) -> str:
-    """Repo-relative mirror path (interpreted under the outputs/ root)."""
+    """Repo-relative mirror path (interpreted under the outputs/ root).
+
+    Every documented output is one file-backed ``.out`` under
+    ``source/includes/example-code-output/``. The strict derivation yields at
+    most one example per output, so its mirror is simply the output's own
+    ``location.path`` — stdout lands exactly on the ``.out`` the docs reference.
+    (If a hand-written interpretation ever lists several ``derived_from``
+    entries, they still share the one ``.out``; the last run wins on disk and
+    ``manifest.yaml`` records each run/model.)
+    """
     p = Path(output["location"]["path"])
-    if output["location"]["kind"] == "file":
-        if ex_idx == 0:
-            return output["location"]["path"]
-        return (p.parent / (p.stem + f".{ex['name']}" + p.suffix)).as_posix()
-    # inline: <dir>/<page-stem>/<example-name>.txt
-    return (p.parent / p.stem / (ex["name"] + ".txt")).as_posix()
+    if output["location"]["kind"] == "inline":
+        # defensive only — the docs have no inline outputs since the .out refactor
+        return (p.parent / p.stem / (ex["name"] + ".txt")).as_posix()
+    return output["location"]["path"]
 
 
 def build_inventory(docs_repo: Path, existing: Optional[dict]) -> dict:
@@ -590,25 +540,29 @@ def build_inventory(docs_repo: Path, existing: Optional[dict]) -> dict:
     existing_by_id = {o.get("id"): o for o in (existing or {}).get("outputs", [])}
 
     for det in outputs:
-        curated = CURATED.get(det.key, {})
+        stem = Path(det.path_rel).stem if det.kind == "file" else (det.slug or "block")
         entry = {
             "id": stable_output_id(det),
-            "title": curated.get("title", "Untitled — add to CURATED map in update_voyage_output.py"),
+            "title": OUTPUT_TITLES.get(stem, f"Output generated by {stem}"),
             "location": {"kind": det.kind, "path": det.path_rel, "line": det.line},
             "rendered_in": det.rendered_in,
-            "derived_from": curated.get("derived_from", []) or [],
+            "derived_from": [],
         }
         if det.kind == "inline":
             entry["location"]["block"] = det.slug
+            entry["match_error"] = ("inline .. output:: blocks are not supported — "
+                                    "move them to example-code-output/<stem>.out")
+        else:
+            derived, err = derive_derived_from(docs_repo, det)
+            entry["derived_from"] = derived
+            if err:
+                entry["match_error"] = err
 
+        # Only free-form writer notes survive a regeneration; derived_from is
+        # recomputed from the docs each time (never carried over from a prior run).
         prev = existing_by_id.get(entry["id"])
-        if prev:
-            if prev.get("derived_from"):
-                entry["derived_from"] = prev["derived_from"]
-            if prev.get("title") and not curated.get("title"):
-                entry["title"] = prev["title"]
-            if prev.get("notes"):
-                entry["notes"] = prev["notes"]
+        if prev and prev.get("notes"):
+            entry["notes"] = prev["notes"]
 
         for ex_idx, ex in enumerate(entry["derived_from"]):
             ex["mirror_target"] = _example_mirror(entry, ex, ex_idx)
@@ -629,10 +583,13 @@ def write_yaml(path: Path, obj: dict) -> None:
     header = (
         "# Documented Voyage AI example outputs under content/voyageai.\n"
         "# Generated by update_voyage_output.py inventory. On a model release:\n"
-        "#   1. update the example scripts/pages in the docs repo,\n"
-        "#   2. re-run this stage,\n"
-        "#   3. optionally edit `derived_from` for outputs the scan got wrong,\n"
-        "#   4. run convert then run.\n"
+        "#   1. update the example scripts / .out names in the docs repo. A .out\n"
+        "#      file must be named after its source script, minus the extension\n"
+        "#      (<name>.out <- <name>.py).\n"
+        "#   2. re-run this stage. Outputs whose .out stem has no *unique* source\n"
+        "#      are flagged with a `match_error` below — the tool alerts, it never\n"
+        "#      guesses the source.\n"
+        "#   3. run convert then run.\n"
         "#\n"
     )
     path.write_text(header + body, encoding="utf-8")
@@ -663,43 +620,28 @@ def _import_modules(text: str, local_names: set[str]) -> set[str]:
     return {m for m in mods if m not in local_names and _module_to_pip(m)}
 
 
-def example_pip_deps(docs_repo: Path, ex: dict) -> set[str]:
-    """Pip package names an example needs, based on its imports.
-
-    Local modules (config.py, ingest_data.py …) are recognized from the flat app
-    assembly / sibling files, never reported as third-party deps.
-    """
-    kind = ex.get("kind")
-    if kind == "block":
-        text = extract_inline_python(docs_repo / ex["source"], ex.get("block", ""))
-        return set(_module_to_pip(m) for m in _import_modules(text, set()))
-
-    if kind == "script":
-        src = docs_repo / ex["source"]
-        if not src.is_file():
-            return set()
-        local = {p.stem for p in src.parent.glob("*.py")}
-        return set(_module_to_pip(m) for m in _import_modules(
-            src.read_text(encoding="utf-8", errors="replace"), local))
-
-    if kind == "app":
-        local = {Path(f).stem for f in ex.get("files", [])}
-        deps: set[str] = set()
-        for f in ex.get("files", []):
-            src = docs_repo / f
-            if src.is_file():
-                deps |= {_module_to_pip(m) for m in _import_modules(
-                    src.read_text(encoding="utf-8", errors="replace"), local)}
-        return deps
-    return set()
-
-
 def detect_requirements(docs_repo: Path, inv: dict) -> list[str]:
-    """Sorted union of pip deps needed by the tool + every inventoried example."""
+    """Sorted union of pip deps the tool + every example under the scope need.
+
+    Scans the whole example tree (all ``.py`` under ``content/voyageai/source``),
+    not just the outputs currently derived — so a temporarily-flagged output
+    (``match_error``) never causes a package the venv still needs to be dropped
+    from requirements.txt. Imports that resolve to an in-tree ``.py`` (local
+    modules like ``config.py`` / ``main.py``'s siblings) are never reported as
+    third-party deps; only modules with no in-tree ``.py`` become pip names.
+    Derived inline blocks are scanned too.
+    """
     deps: set[str] = set(TOOL_DEPS) | set(EXTRA_RUNTIME_DEPS)
+    root = docs_repo / DOCS_SCOPE / "source"
+    local = {f.stem for f in root.rglob("*.py")}
+    for f in root.rglob("*.py"):
+        deps |= {_module_to_pip(m) for m in _import_modules(
+            f.read_text(encoding="utf-8", errors="replace"), local)}
     for out in inv.get("outputs", []):
         for ex in out.get("derived_from", []):
-            deps |= example_pip_deps(docs_repo, ex)
+            if ex.get("kind") == "block":
+                text = extract_inline_python(docs_repo / ex["source"], ex.get("block", ""))
+                deps |= {_module_to_pip(m) for m in _import_modules(text, local)}
     return sorted(deps)
 
 
@@ -884,16 +826,25 @@ def file_uses_llm(text: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 def extract_inline_python(page: Path, slug: str) -> str:
+    """Return the python from the ``.. input::`` that shares an io-code-block
+    with the ``.. output::`` node whose heading slug is ``slug``.
+
+    Output nodes may be inline (``.. output::`` with a body) or file-backed
+    (``.. output:: /includes/example-code-output/tokenization-tokenize.out``) —
+    both live next to the ``.. input::`` python we want (the tokenize /
+    count_tokens / count_usage blocks in ``tutorials/tokenization.txt``).
+    """
     lines = page.read_text(encoding="utf-8", errors="replace").splitlines()
     tree = build_directive_tree(lines)
     n = 0
     for node in _walk(tree, "output"):
-        if node["arg"]:
-            continue
         heading = nearest_heading(lines, node["line"])
-        s = slugify(heading) if heading else f"block-{n}"
-        n += 1
-        if s == slug:
+        if node["arg"]:
+            s = slugify(heading) if heading else ""
+        else:
+            s = slugify(heading) if heading else f"block-{n}"
+            n += 1
+        if s and s == slug:
             return _input_python_for(node, tree) or extract_code(node["content"] or [])
     return ""
 
@@ -953,6 +904,8 @@ def cmd_convert(args) -> int:
     converted_root.mkdir(parents=True, exist_ok=True)
     n = 0
     for output in args.inventory["outputs"]:
+        if output.get("match_error"):
+            print(f"! {output['id']}: {output['match_error']}  (skipping)")
         for ex in output.get("derived_from", []):
             ok = convert_one(docs_repo, ex, converted_root)
             if ok:
@@ -1019,8 +972,42 @@ def _model_candidates(ex: dict, fallback_map: dict, pinned_model: Optional[str])
     return out
 
 
-def run_one(ex: dict, converted_root: Path, venv_python: Path, assets_dir: Optional[Path],
-            timeout: int, dry_run: bool, verbose: bool,
+def _local_module_stems(docs_repo: Path, ex: dict) -> set[str]:
+    """Stems of the local/sibling modules this example expects beside its
+    source — the files a single-script copy into converted/ won't carry with it.
+    (``main.py`` importing ``generate_response``/``config`` is the case in point.)"""
+    names: set[str] = set()
+    kind = ex.get("kind")
+    if kind == "script":
+        src = docs_repo / (ex.get("source") or "")
+        if src.is_file():
+            names |= {f.stem for f in src.parent.glob("*.py")}
+    elif kind == "app":
+        names |= {Path(f).stem for f in ex.get("files", [])}
+    names.discard("__init__")
+    return names
+
+
+def _local_import_hits(err: str, local_stems: set[str]) -> list[str]:
+    """Local sibling modules whose import broke the run (a relative/local import
+    that has no file beside it in converted/), or a marker when a bare relative
+    import failed with no parent package."""
+    if "attempted relative import with no known parent package" in err.lower():
+        return ["<relative import>"]
+    hits: set[str] = set()
+    for m in re.finditer(r"No module named '([^']+)'", err):
+        name = m.group(1).split(".")[0]
+        if name in local_stems:
+            hits.add(name)
+    for m in re.finditer(r"cannot import name '[^']+' from '([^']+)'", err):
+        name = m.group(1).split(".")[0]
+        if name in local_stems:
+            hits.add(name)
+    return sorted(hits)
+
+
+def run_one(ex: dict, docs_repo: Path, converted_root: Path, venv_python: Path,
+            assets_dir: Optional[Path], timeout: int, dry_run: bool, verbose: bool,
             fallback_map: Optional[dict] = None,
             pinned_model: Optional[str] = None) -> tuple[int, str, str, str, str]:
     """Run a single example, retrying with a comparable Grove model when the
@@ -1103,18 +1090,30 @@ def run_one(ex: dict, converted_root: Path, venv_python: Path, assets_dir: Optio
         elif _model_unavailable(err):
             reason = "model unavailable on Grove (tried: " + ", ".join(candidates) + ")"
         else:
-            reason = f"error (exit {rc})"
+            imports = _local_import_hits(err, _local_module_stems(docs_repo, ex))
+            if imports:
+                reason = "local/relative import unmet: " + ", ".join(imports)
+            else:
+                reason = f"error (exit {rc})"
+    # Stamp the log line with the classified reason so it's visible inline too.
+    if rc != 0 and reason and reason != f"error (exit {rc})":
+        logs.append(f"  ↳ {reason}")
     return rc, out, "\n".join(logs), model_used, reason
 
 
-def build_run_summary(runs: list[dict], dry_run: bool) -> str:
+def build_run_summary(runs: list[dict], dry_run: bool,
+                      missing_sources: Optional[list[dict]] = None) -> str:
     """Human-readable summary printed at the end of `run` — what succeeded/failed,
-    which Grove model was used, and how to fix any skips."""
+    which Grove model was used, which outputs had no source file, and how to fix
+    the skips."""
+    missing_sources = list(missing_sources or [])
     ok_n = sum(1 for r in runs if r.get("ok"))
     tot = len(runs)
     w = 78
-    lines = ["=" * w,
-             f"RUN SUMMARY — {ok_n}/{tot} examples clean" + (" (dry-run)" if dry_run else "")]
+    header = f"RUN SUMMARY — {ok_n}/{tot} examples clean" + (" (dry-run)" if dry_run else "")
+    if missing_sources:
+        header += f" — {len(missing_sources)} output(s) skipped (no source .py)"
+    lines = ["=" * w, header]
     models: dict[str, int] = {}
     for r in runs:
         if r.get("model"):
@@ -1146,8 +1145,18 @@ def build_run_summary(runs: list[dict], dry_run: bool) -> str:
         if any("model unavailable" in (r.get("reason") or "") for r in failed):
             hints.append("pin GROVE_MODEL (see the `models` subcommand) or edit "
                          "grove.model_fallbacks in inventory.yaml")
+        if any("local/relative import unmet" in (r.get("reason") or "") for r in failed):
+            hints.append("copy the example's sibling modules beside it in "
+                         "converted/ (or make it self-contained) so its imports resolve")
         if hints:
             lines.append("To fix: " + " | ".join(hints))
+
+    if missing_sources:
+        lines.append("")
+        lines.append("Outputs with no source file — the .out stem must match a "
+                     "unique <stem>.py; rename source files in the docs PR:")
+        for o in missing_sources:
+            lines.append(f"  · {Path(o['location']['path']).name}: {o['match_error']}")
     lines.append("=" * w)
     return "\n".join(lines)
 
@@ -1170,7 +1179,10 @@ def cmd_run(args) -> int:
     pinned_model = os.environ.get(GROVE_MODEL_ENV) or None
 
     runs, failures, count = [], 0, 0
+    seen_targets: dict[str, str] = {}
     for output in args.inventory["outputs"]:
+        if output.get("match_error"):
+            print(f"! {output['id']}: {output['match_error']}  (skipping)")
         for ex in output.get("derived_from", []):
             count += 1
             if args.limit and count > args.limit:
@@ -1180,7 +1192,7 @@ def cmd_run(args) -> int:
                 continue
             print(f"▶ {output['id']} / {ex.get('name')}  ({ex.get('kind')})")
             rc, stdout, logs, model_used, reason = run_one(
-                ex, converted_root, venv_python, assets_dir,
+                ex, Path(args.docs_repo), converted_root, venv_python, assets_dir,
                 args.timeout, args.dry_run, args.verbose,
                 fallback_map, pinned_model)
             print(logs)
@@ -1189,6 +1201,11 @@ def cmd_run(args) -> int:
             target = outputs_root / ex.get("mirror_target", output["id"] + ".txt")
             if not args.dry_run:
                 target.parent.mkdir(parents=True, exist_ok=True)
+                if str(target) in seen_targets:
+                    print(f"  ! shared target — {target.name} previously held "
+                          f"{seen_targets[str(target)]}; now holds {ex.get('name')} "
+                          f"(manifest.yaml records both runs/models)")
+                seen_targets[str(target)] = ex.get("name", "?")
                 target.write_text(stdout, encoding="utf-8")
             runs.append({"output": output["id"], "example": ex.get("name"),
                          "ok": rc == 0, "exit": rc, "target": ex.get("mirror_target"),
@@ -1201,7 +1218,8 @@ def cmd_run(args) -> int:
         (outputs_root / "manifest.yaml").write_text(
             yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
 
-    print("\n" + build_run_summary(runs, args.dry_run))
+    missing = [o for o in args.inventory["outputs"] if o.get("match_error")]
+    print("\n" + build_run_summary(runs, args.dry_run, missing_sources=missing))
     return failures
 
 
@@ -1424,10 +1442,18 @@ def main(argv: Optional[list[str]] = None) -> int:
               f"voyage models: {inv['voyage_models_observed']}")
         if inv.get("stale_output_ids"):
             print("  stale (no longer detected): " + ", ".join(inv["stale_output_ids"]))
+        bad = [o for o in inv["outputs"] if o.get("match_error")]
         for o in inv["outputs"]:
-            n = len(o.get("derived_from", []))
-            flag = "" if n else "   <-- add to CURATED map in the script"
-            print(f"  - {o['id']:<40} {o['title'][:60]}{flag}")
+            if o.get("derived_from"):
+                src = o["derived_from"][0]["source"]
+                print(f"  - {o['id']:<44} {o['title'][:50]}  ← {src}")
+            else:
+                print(f"  - {o['id']:<44} {o['title'][:50]}  ⚠ no source")
+        if bad:
+            print("  ⚠ " + str(len(bad)) + " output(s) have no unique source script "
+                  "(rename the producing .py so <name>.out ↔ <name>.py, or fix the .out name):")
+            for o in bad:
+                print(f"    - {o['id']}: {o['match_error']}")
         return 0
 
     if args.command == "all":

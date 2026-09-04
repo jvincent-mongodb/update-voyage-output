@@ -18,8 +18,13 @@ Two sibling repos sit under the parent dir `..`:
 ## The pipeline (one script, opt-in flags)
 
 - `update_voyage_output.py inventory` — scan `content/voyageai` for documented
-  outputs (`.. output::` directive file-backed or inline, plus unreferenced
-  `*-output.md` files) → write `inventory.yaml`. Also syncs `requirements.txt`
+  outputs (`.. output:: /includes/example-code-output/<name>.out` directives,
+  plus unreferenced `*.out` files under `source/includes/`) → write
+  `inventory.yaml`. Each `.out` file is named after its source script
+  (`<name>.out` ← `<name>.py`, found as the unique matching `.py` under
+  `content/voyageai/source`); outputs that can't be mapped that way are flagged
+  with a `match_error` and **alerted, never guessed** — fix the file names.
+  Also syncs `requirements.txt`
   to what the examples import and installs the delta with `uv pip` (opt out via
   `--no-sync`); see `TOOL_DEPS`/`EXTRA_RUNTIME_DEPS` in the script.
 - `update_voyage_output.py convert` — copy each example into `converted/<mirror>`,
@@ -49,9 +54,10 @@ at the user's clone. Resolution order: flag → env → `inventory.yaml`'s
 ## Key files
 
 - `update_voyage_output.py` — the whole tool.
-- `inventory.yaml` — durable, curatable inventory. The `CURATED` dict inside the
-  script (and user edits to this YAML) own the `derived_from` mapping
-  output → example(s); the scan owns `location`/`rendered_in`/models.
+- `inventory.yaml` — durable inventory regenerated each release. The scan owns
+  `location`/`rendered_in`/models; `derived_from` is *derived* from the `.out`
+  file names (`<name>.out` ← `<name>.py`). Outputs whose stem has no unique
+  source `.py` carry a `match_error` instead — rename the files to fix.
 - `DESIGN.md` — full design rationale, Grove semantics, release checklist,
   known quirks. **Read it before changing conversion or run behavior.**
 - `.venv/` — uv-managed venv (Python 3.13) with all example deps installed.
